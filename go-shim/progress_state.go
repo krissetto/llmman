@@ -43,8 +43,9 @@ type progressEntry struct {
 }
 
 var progressState struct {
-	mu      sync.Mutex
-	entries map[string]*progressEntry
+	mu       sync.Mutex
+	entries  map[string]*progressEntry
+	finished map[string]*progressEntry
 }
 
 // entryLocked returns key's entry, creating it if absent. Callers must
@@ -80,6 +81,7 @@ func progressReset(key, status string) {
 		progressState.entries = make(map[string]*progressEntry)
 	}
 	progressState.entries[key] = &progressEntry{status: status}
+	delete(progressState.finished, key)
 }
 
 // progressSetStatus updates only the status text (e.g. "pulling manifest"
@@ -119,18 +121,23 @@ func progressAddCompleted(key string, delta int64) {
 	entryLocked(key).completed += delta
 }
 
-// progressDone removes key's entry once its pull/push has finished
-// (successfully or not) — called via defer from llmman_pull/llmman_push,
-// so a long-running daemon doesn't accumulate one stale entry per
-// distinct model ref it has ever pulled/pushed. Safe to call for a key
-// that was never tracked (empty key, or a poll raced past completion).
+// progressDone moves key's last snapshot aside until cmd::serve consumes it
+// after the transfer task resolves. Deleting it immediately races the relay:
+// a short transfer can finish between 200ms polls and otherwise expose only
+// "success", never its final bytes.
 func progressDone(key string) {
 	if key == "" {
 		return
 	}
 	progressState.mu.Lock()
 	defer progressState.mu.Unlock()
-	delete(progressState.entries, key)
+	if e, ok := progressState.entries[key]; ok {
+		if progressState.finished == nil {
+			progressState.finished = make(map[string]*progressEntry)
+		}
+		progressState.finished[key] = e
+		delete(progressState.entries, key)
+	}
 }
 
 // progressSnapshot is the JSON shape returned (as the `data` field of the
@@ -157,6 +164,23 @@ func llmman_progress(cKey *C.char) *C.char {
 	var snap progressSnapshot
 	if e, ok := progressState.entries[key]; ok {
 		snap = progressSnapshot{Status: e.status, Total: e.total, Completed: e.completed}
+	}
+	progressState.mu.Unlock()
+	data, _ := json.Marshal(snap)
+	return okResp(string(data))
+}
+
+// llmman_progress_final consumes the terminal snapshot retained by
+// progressDone. cmd::serve calls it exactly once after joining the task.
+//
+//export llmman_progress_final
+func llmman_progress_final(cKey *C.char) *C.char {
+	key := C.GoString(cKey)
+	progressState.mu.Lock()
+	var snap progressSnapshot
+	if e, ok := progressState.finished[key]; ok {
+		snap = progressSnapshot{Status: e.status, Total: e.total, Completed: e.completed}
+		delete(progressState.finished, key)
 	}
 	progressState.mu.Unlock()
 	data, _ := json.Marshal(snap)

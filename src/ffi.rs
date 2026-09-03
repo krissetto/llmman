@@ -25,6 +25,7 @@ extern "C" {
     fn llmman_inspect(reference: *const c_char) -> *mut c_char;
     fn llmman_transfer(source: *const c_char, destination: *const c_char) -> *mut c_char;
     fn llmman_progress(key: *const c_char) -> *mut c_char;
+    fn llmman_progress_final(key: *const c_char) -> *mut c_char;
 }
 
 // go-shim/push_stream.go is `!podman`-only: containerd's docker.Resolver
@@ -340,7 +341,24 @@ pub struct ProgressSnapshot {
 /// concurrently in the same daemon without their progress numbers
 /// interleaving — see serve.rs's per-model lock registry.
 pub fn progress(key: &str) -> anyhow::Result<ProgressSnapshot> {
+    progress_call(key, false)
+}
+
+/// Consumes the terminal Go snapshot retained when pull/push returns. This
+/// closes the task-vs-poll race without delaying either side.
+pub fn progress_final(key: &str) -> anyhow::Result<ProgressSnapshot> {
+    progress_call(key, true)
+}
+
+fn progress_call(key: &str, final_snapshot: bool) -> anyhow::Result<ProgressSnapshot> {
     let k = cstr(key)?;
-    let data = consume(unsafe { llmman_progress(k.as_ptr()) })?;
+    let ptr = unsafe {
+        if final_snapshot {
+            llmman_progress_final(k.as_ptr())
+        } else {
+            llmman_progress(k.as_ptr())
+        }
+    };
+    let data = consume(ptr)?;
     serde_json::from_str(&data).context("failed to decode progress snapshot")
 }

@@ -378,14 +378,90 @@ func copyImageWithProgress(ctx context.Context, pctx *signature.PolicyContext, d
 	// as a follow-up. Malformed refs never reach this path: validate_reference
 	// (Rust, Layer B) rejects them up front.
 	var manifestData []byte
+	var reducer artifactProgressReducer
 	err := retryStream(ctx, progressKey, isHTTP4xx, func() error {
-		data, err := copyImageAttempt(ctx, pctx, dst, src, present, pastTense, opts, changed, progressKey)
+		data, err := copyImageAttempt(ctx, pctx, dst, src, present, pastTense, opts, changed, progressKey, &reducer)
 		if err == nil {
 			manifestData = data
 		}
 		return err
 	})
 	return manifestData, err
+}
+
+type artifactProgress struct {
+	size      int64
+	offset    uint64
+	completed int64
+}
+
+// artifactProgressReducer converts copy.Image's per-artifact cumulative
+// Offset into aggregate deltas. OffsetUpdate is only the bytes since the
+// library's last report and may be zero on coalesced Read/Done events, so it
+// cannot be the source of truth. completed survives a retry while newArtifact
+// resets only the attempt-local offset; this prevents both losing a short
+// transfer's final bytes and double-counting bytes already credited by an
+// earlier attempt.
+type artifactProgressReducer struct {
+	artifacts map[string]*artifactProgress
+}
+
+func (r *artifactProgressReducer) newArtifact(key string, size int64) int64 {
+	if size < 0 {
+		size = 0
+	}
+	if r.artifacts == nil {
+		r.artifacts = make(map[string]*artifactProgress)
+	}
+	artifact, ok := r.artifacts[key]
+	if !ok {
+		r.artifacts[key] = &artifactProgress{size: size}
+		return size
+	}
+	artifact.offset = 0 // a retry starts this artifact's cumulative Offset over
+	if size > artifact.size {
+		delta := size - artifact.size
+		artifact.size = size
+		return delta
+	}
+	return 0
+}
+
+func (r *artifactProgressReducer) update(key string, offset uint64) int64 {
+	artifact, ok := r.artifacts[key]
+	if !ok || offset <= artifact.offset {
+		return 0
+	}
+	previous := artifact.offset
+	artifact.offset = offset
+	remaining := artifact.size - artifact.completed
+	if remaining <= 0 {
+		return 0
+	}
+	// A retry restarts Offset at zero. Aggregate completed is therefore also
+	// the furthest cumulative offset already credited across earlier attempts.
+	// Only credit movement beyond both that frontier and this attempt's last
+	// event, capped to the declared artifact size.
+	frontier := max(previous, uint64(artifact.completed))
+	if offset <= frontier {
+		return 0
+	}
+	delta := offset - frontier
+	if delta > uint64(remaining) {
+		delta = uint64(remaining)
+	}
+	artifact.completed += int64(delta)
+	return int64(delta)
+}
+
+func (r *artifactProgressReducer) skip(key string, size int64) (int64, int64) {
+	totalDelta := r.newArtifact(key, size)
+	artifact := r.artifacts[key]
+	completedDelta := artifact.size - artifact.completed
+	if completedDelta > 0 {
+		artifact.completed += completedDelta
+	}
+	return totalDelta, max(completedDelta, 0)
 }
 
 // copyImageAttempt runs a single copy.Image call with an mpb bar per
@@ -430,7 +506,7 @@ func copyImageWithProgress(ctx context.Context, pctx *signature.PolicyContext, d
 // full expected size on disk, yet the pull never returned, which a
 // per-artifact check (rather than the aggregate one) is what's actually
 // needed to catch.
-func copyImageAttempt(ctx context.Context, pctx *signature.PolicyContext, dst, src types.ImageReference, present, pastTense string, opts *copy.Options, changed *bool, progressKey string) ([]byte, error) {
+func copyImageAttempt(ctx context.Context, pctx *signature.PolicyContext, dst, src types.ImageReference, present, pastTense string, opts *copy.Options, changed *bool, progressKey string, reducer *artifactProgressReducer) ([]byte, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -464,7 +540,7 @@ func copyImageAttempt(ctx context.Context, pctx *signature.PolicyContext, dst, s
 				if total < 0 {
 					total = 0
 				}
-				progressAddTotal(progressKey, total)
+				progressAddTotal(progressKey, reducer.newArtifact(key, total))
 				short := p.Artifact.Digest.Hex()
 				if len(short) > 12 {
 					short = short[:12]
@@ -491,31 +567,19 @@ func copyImageAttempt(ctx context.Context, pctx *signature.PolicyContext, dst, s
 				}
 				mu.Unlock()
 
-				progressAddCompleted(progressKey, int64(p.OffsetUpdate))
+				delta := reducer.update(key, p.Offset)
+				progressAddCompleted(progressKey, delta)
 				if bar, ok := bars[key]; ok {
-					bar.IncrInt64(int64(p.OffsetUpdate))
+					bar.IncrInt64(delta)
 				}
 			case types.ProgressEventDone:
 				mu.Lock()
 				delete(openArtifacts, key)
 				mu.Unlock()
 
-				// p.OffsetUpdate here is whatever portion of this
-				// artifact's bytes hadn't yet been reported by a Read
-				// event above (see progressReader.reportDone in
-				// go.podman.io/image's copy/progress_channel.go: Offset
-				// is the cumulative total, OffsetUpdate is the remainder
-				// since the last update) — the same field, same meaning,
-				// as ProgressEventRead's own OffsetUpdate just above.
-				// Without this, any transfer that finishes inside a
-				// single 200ms ProgressInterval tick (small blobs
-				// routinely do) never fires a single Read event at all —
-				// only NewArtifact (sets total) then straight to Done —
-				// so completed silently stayed at 0 for that artifact
-				// forever, however long the rest of the pull took: a
-				// correctly-sized, permanently-empty-looking bar, not
-				// merely a delayed one.
-				progressAddCompleted(progressKey, int64(p.OffsetUpdate))
+				// Offset is cumulative and remains authoritative even when
+				// OffsetUpdate is zero because the final report was coalesced.
+				progressAddCompleted(progressKey, reducer.update(key, p.Offset))
 
 				if changed != nil {
 					*changed = true
@@ -571,8 +635,9 @@ func copyImageAttempt(ctx context.Context, pctx *signature.PolicyContext, dst, s
 				// picture of the whole pull's bytes while marking this
 				// artifact's share instantly done, exactly like a real
 				// transfer that finished the moment it started.
-				progressAddTotal(progressKey, p.Artifact.Size)
-				progressAddCompleted(progressKey, p.Artifact.Size)
+				totalDelta, completedDelta := reducer.skip(key, p.Artifact.Size)
+				progressAddTotal(progressKey, totalDelta)
+				progressAddCompleted(progressKey, completedDelta)
 				if bar, ok := bars[key]; ok {
 					bar.Abort(true)
 					delete(bars, key)

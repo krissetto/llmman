@@ -2193,10 +2193,56 @@ async fn acquire_load_lock(model: &str) -> LoadLockGuard {
 /// as do the `ms://`/`ngc://`/`s3://`/`gs://`/local-path sources
 /// (`crate::sources`); only an actual OCI registry still goes through
 /// the Go shim.
-fn pull_serialized(store_path: &std::path::Path, model: &str) -> anyhow::Result<()> {
+type SerializedTransferResult = (anyhow::Result<()>, Option<String>);
+
+/// Owns one invocation's retained terminal progress while its model lock is
+/// held. `take` returns it to an HTTP relay; Drop still consumes/discards it
+/// for internal callers, errors, and unwinding.
+struct TerminalProgress<'a> {
+    model: &'a str,
+    verb: &'a str,
+    taken: bool,
+}
+
+impl TerminalProgress<'_> {
+    fn take(&mut self) -> Option<String> {
+        self.taken = true;
+        progress_snapshot_line(self.model, self.verb, true)
+    }
+}
+
+impl Drop for TerminalProgress<'_> {
+    fn drop(&mut self) {
+        if !self.taken {
+            let _ = progress_snapshot_line(self.model, self.verb, true);
+        }
+    }
+}
+
+fn with_model_transfer_lock(
+    model: &str,
+    verb: &str,
+    operation: impl FnOnce() -> anyhow::Result<()>,
+) -> SerializedTransferResult {
     let lock = model_lock(model);
-    let result = (|| {
+    let result = {
         let _guard = lock.blocking_lock();
+        let mut terminal = TerminalProgress {
+            model,
+            verb,
+            taken: false,
+        };
+        let result = operation();
+        let final_progress = terminal.take();
+        (result, final_progress)
+    };
+    drop(lock);
+    release_model_lock(model);
+    result
+}
+
+fn pull_serialized(store_path: &std::path::Path, model: &str) -> SerializedTransferResult {
+    with_model_transfer_lock(model, "pull", || {
         if OciStore::open(store_path)
             .and_then(|s| s.find(model))
             .is_ok()
@@ -2222,10 +2268,7 @@ fn pull_serialized(store_path: &std::path::Path, model: &str) -> anyhow::Result<
                 }
             }
         })
-    })();
-    drop(lock);
-    release_model_lock(model);
-    result
+    })
 }
 
 /// Resolve a user-supplied model ref to the canonical reference stored in
@@ -2935,6 +2978,7 @@ async fn ensure_model(
         tokio::task::spawn_blocking(move || pull_serialized(&store_path, &model_ref_owned))
             .await
             .context("pull task panicked")?
+            .0
             .context("pull failed")?;
     }
 
@@ -4561,17 +4605,12 @@ async fn handle_push(
     // but a push of one model no longer blocks a pull/push of another.
     let model_for_task = model.clone();
     let push_task = tokio::task::spawn_blocking(move || {
-        let lock = model_lock(&model_for_task);
-        let result = (|| {
-            let _guard = lock.blocking_lock();
+        with_model_transfer_lock(&model_for_task, "push", || {
             let layout_dir = store_path
                 .to_str()
                 .ok_or_else(|| anyhow!("store path is not valid UTF-8"))?;
             crate::ffi::push(layout_dir, &model_for_task)
-        })();
-        drop(lock);
-        release_model_lock(&model_for_task);
-        result
+        })
     });
 
     Ok(stream_ffi_progress(
@@ -4602,11 +4641,46 @@ async fn handle_push(
 /// inside the daemon, whose stdio is redirected to a log file (see
 /// daemon::ensure_server), so polling and relaying over this NDJSON
 /// stream is the only way those numbers reach `llmman pull`/`llmman push`.
+fn progress_snapshot_line(model: &str, verb: &str, final_snapshot: bool) -> Option<String> {
+    let rust_snap = if final_snapshot {
+        crate::hf::progress::poll_final(model)
+    } else {
+        crate::hf::progress::poll(model)
+    };
+    let go_snap = (rust_snap.total == 0)
+        .then(|| {
+            if final_snapshot {
+                crate::ffi::progress_final(model)
+            } else {
+                crate::ffi::progress(model)
+            }
+            .ok()
+        })
+        .flatten();
+    let (status, total, completed) = if rust_snap.total > 0 {
+        (rust_snap.status, rust_snap.total, rust_snap.completed)
+    } else if !rust_snap.status.is_empty() {
+        (rust_snap.status, 0, 0)
+    } else if let Some(p) = go_snap {
+        (p.status, p.total, p.completed)
+    } else {
+        (String::new(), 0, 0)
+    };
+    (total > 0).then(|| {
+        serde_json::json!({
+            "status": if status.is_empty() { format!("{verb}ing {model}") } else { status },
+            "total": total.max(0),
+            "completed": completed.clamp(0, total),
+        })
+        .to_string()
+    })
+}
+
 fn stream_ffi_progress(
     model: String,
     verb: &'static str,
     first_status: &'static str,
-    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    task: tokio::task::JoinHandle<(anyhow::Result<()>, Option<String>)>,
 ) -> Response {
     let first_line = serde_json::json!({"status": first_status}).to_string() + "\n";
     let stream = futures::stream::once(futures::future::ready(Bytes::from(first_line)))
@@ -4616,42 +4690,29 @@ fn stream_ffi_progress(
                 let mut task = task?;
                 tokio::select! {
                     result = &mut task => {
-                        let line = match result {
-                            Ok(Ok(())) => serde_json::json!({"status": "success"}).to_string(),
-                            Ok(Err(e)) => serde_json::json!({"error": format!("{e:#}")}).to_string(),
-                            Err(e) => serde_json::json!({"error": format!("{verb} task panicked: {e}")}).to_string(),
+                        let (terminal, final_progress) = match result {
+                            Ok((Ok(()), final_progress)) => {
+                                (serde_json::json!({"status": "success"}).to_string(), final_progress)
+                            }
+                            Ok((Err(e), final_progress)) => {
+                                (serde_json::json!({"error": format!("{e:#}")}).to_string(), final_progress)
+                            }
+                            Err(e) => (serde_json::json!({"error": format!("{verb} task panicked: {e}")}).to_string(), None),
                         };
-                        Some((Bytes::from(line + "\n"), None))
+                        // The worker consumes the producer's retained terminal
+                        // snapshot before returning, so even a dropped client
+                        // cannot leak it. Put those bytes before success/error.
+                        let mut lines = final_progress
+                            .map(|line| line + "\n")
+                            .unwrap_or_default();
+                        lines.push_str(&terminal);
+                        lines.push('\n');
+                        Some((Bytes::from(lines), None))
                     }
                     _ = sleep(Duration::from_millis(200)) => {
-                        // A HuggingFace pull tracks its own progress natively
-                        // (crate::hf::progress) rather than through the Go
-                        // shim's — check that first, since only one of the
-                        // two will ever actually be tracking `model` for a
-                        // given task.
-                        let rust_snap = crate::hf::progress::poll(&model);
-                        let go_snap = (rust_snap.total == 0).then(|| crate::ffi::progress(&model).ok()).flatten();
-                        let (status, total, completed) = if rust_snap.total > 0 {
-                            (rust_snap.status, rust_snap.total, rust_snap.completed)
-                        } else if !rust_snap.status.is_empty() {
-                            (rust_snap.status, 0, 0)
-                        } else if let Some(p) = &go_snap {
-                            (p.status.clone(), p.total, p.completed)
-                        } else {
-                            (String::new(), 0, 0)
-                        };
-                        let line = if total > 0 {
-                            serde_json::json!({
-                                "status": if status.is_empty() { format!("{verb}ing {model}") } else { status },
-                                "total": total.max(0),
-                                "completed": completed.clamp(0, total),
-                            })
-                        } else if !status.is_empty() {
-                            serde_json::json!({"status": status})
-                        } else {
-                            serde_json::json!({"status": format!("{verb}ing {model}")})
-                        };
-                        Some((Bytes::from(line.to_string() + "\n"), Some(task)))
+                        let line = progress_snapshot_line(&model, verb, false)
+                            .unwrap_or_else(|| serde_json::json!({"status": format!("{verb}ing {model}")}).to_string());
+                        Some((Bytes::from(line + "\n"), Some(task)))
                     }
                 }
             }
@@ -5955,6 +6016,88 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serialized_transfer_keeps_terminal_snapshot_with_own_same_model_request() {
+        let model = "test::serialized-terminal-handoff";
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let first = std::thread::spawn(move || {
+            with_model_transfer_lock(model, "pull", || {
+                crate::hf::progress::reset(model, "pulling");
+                crate::hf::progress::add_total(model, 100);
+                crate::hf::progress::add_completed(model, 100);
+                crate::hf::progress::done(model);
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        locked_rx.recv().unwrap();
+        let second = std::thread::spawn(move || {
+            // Models the waiter finding the model in the store: it creates no
+            // progress state and must not inherit request one's snapshot.
+            with_model_transfer_lock(model, "pull", || Ok(()))
+        });
+        release_tx.send(()).unwrap();
+
+        let (_, first_progress) = first.join().unwrap();
+        let (_, second_progress) = second.join().unwrap();
+        assert!(first_progress.as_deref().is_some_and(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            value["completed"] == 100
+        }));
+        assert_eq!(second_progress, None);
+        assert_eq!(crate::hf::progress::poll_final(model).total, 0);
+    }
+
+    #[test]
+    fn serialized_transfer_consumes_terminal_snapshot_on_error() {
+        let model = "test::serialized-terminal-error";
+        let (result, progress) = with_model_transfer_lock(model, "pull", || {
+            crate::hf::progress::reset(model, "pulling");
+            crate::hf::progress::add_total(model, 10);
+            crate::hf::progress::done(model);
+            Err(anyhow!("synthetic failure"))
+        });
+        assert!(result.is_err());
+        assert!(progress.is_some());
+        assert_eq!(crate::hf::progress::poll_final(model).total, 0);
+    }
+
+    #[tokio::test]
+    async fn stream_ffi_progress_emits_changed_final_bytes_before_success() {
+        let model = "test::final-progress-before-success";
+        crate::hf::progress::reset(model, "pulling");
+        crate::hf::progress::add_total(model, 100);
+        crate::hf::progress::add_completed(model, 100);
+        crate::hf::progress::done(model);
+
+        let response = stream_ffi_progress(
+            model.to_string(),
+            "pull",
+            "retrieving manifest",
+            tokio::spawn(async { (Ok(()), progress_snapshot_line(model, "pull", true)) }),
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let lines: Vec<serde_json::Value> = std::str::from_utf8(&body)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let final_progress = lines
+            .iter()
+            .position(|line| line["completed"] == 100)
+            .expect("terminal byte snapshot");
+        let success = lines
+            .iter()
+            .position(|line| line["status"] == "success")
+            .expect("success line");
+        assert!(final_progress < success, "lines: {lines:?}");
+    }
 
     // -- request targets (local backend vs remote provider) -----------------
 

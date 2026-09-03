@@ -20,6 +20,8 @@ struct Entry {
 
 static STATE: LazyLock<Mutex<HashMap<String, Entry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static FINISHED: LazyLock<Mutex<HashMap<String, Entry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Mirrors `ffi::ProgressSnapshot`'s shape exactly, so `cmd::serve` can
 /// treat a Rust-native and a Go-shim-polled snapshot identically.
@@ -45,6 +47,7 @@ pub fn reset(key: &str, status: &str) {
             ..Default::default()
         },
     );
+    FINISHED.lock().unwrap().remove(key);
 }
 
 pub fn set_status(key: &str, status: &str) {
@@ -86,12 +89,15 @@ pub fn add_completed(key: &str, delta: i64) {
         .completed += delta;
 }
 
-/// Removes key's entry once its pull has finished (successfully or not).
+/// Retains the terminal snapshot until the relay consumes it after joining
+/// the transfer task, avoiding a completion-between-polls race.
 pub fn done(key: &str) {
     if key.is_empty() {
         return;
     }
-    STATE.lock().unwrap().remove(key);
+    if let Some(entry) = STATE.lock().unwrap().remove(key) {
+        FINISHED.lock().unwrap().insert(key.to_string(), entry);
+    }
 }
 
 /// Returns key's current snapshot, or a zero-value one if untracked (not
@@ -106,6 +112,15 @@ pub fn poll(key: &str) -> Snapshot {
         },
         None => Snapshot::default(),
     }
+}
+
+pub fn poll_final(key: &str) -> Snapshot {
+    let entry = FINISHED.lock().unwrap().remove(key);
+    entry.map_or_else(Snapshot::default, |e| Snapshot {
+        status: e.status,
+        total: e.total,
+        completed: e.completed,
+    })
 }
 
 /// RAII guard that calls [`done`] when dropped — covers every early
@@ -156,6 +171,17 @@ mod tests {
     }
 
     #[test]
+    fn terminal_snapshot_is_consumed_once() {
+        let key = "test::terminal_snapshot_is_consumed_once";
+        reset(key, "pulling");
+        add_total(key, 100);
+        add_completed(key, 100);
+        done(key);
+        assert_eq!(poll_final(key).completed, 100);
+        assert_eq!(poll_final(key).completed, 0);
+    }
+
+    #[test]
     fn done_guard_cleans_up_on_drop() {
         let key = "test::done_guard_cleans_up_on_drop";
         reset(key, "pulling");
@@ -166,7 +192,9 @@ mod tests {
         assert_eq!(
             poll(key).total,
             0,
-            "entry must be gone once the guard drops"
+            "live entry must be gone once the guard drops"
         );
+        assert_eq!(poll_final(key).total, 10, "terminal entry is take-once");
+        assert_eq!(poll_final(key).total, 0, "terminal entry was consumed");
     }
 }

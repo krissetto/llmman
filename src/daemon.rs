@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::Context;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde::Deserialize;
 
 /// Default bind host/port when `LLMMAN_HOST` is unset/blank.
@@ -803,10 +803,41 @@ struct ProgressLine {
 /// top of each other, for no added information.
 fn progress_bar_style() -> ProgressStyle {
     ProgressStyle::with_template(
-        "{msg:<20} [{bar:32.cyan/blue}] {bytes:>10}/{total_bytes:<10} {bytes_per_sec:>12}",
+        "{spinner:.cyan} {msg:<20} [{bar:32.cyan/blue}] {bytes:>10}/{total_bytes:<10} {bytes_per_sec:>12}",
     )
     .unwrap_or_else(|_| ProgressStyle::default_bar())
     .progress_chars("=> ")
+    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
+}
+
+struct TransferProgress {
+    bar: ProgressBar,
+    position: u64,
+}
+
+impl TransferProgress {
+    fn new(total: u64, reference: &str) -> Self {
+        Self::with_target(total, reference, ProgressDrawTarget::stderr())
+    }
+
+    fn with_target(total: u64, reference: &str, draw_target: ProgressDrawTarget) -> Self {
+        let bar = ProgressBar::with_draw_target(Some(total), draw_target);
+        bar.set_style(progress_bar_style());
+        bar.set_message(reference.to_string());
+        bar.enable_steady_tick(Duration::from_millis(100));
+        Self { bar, position: 0 }
+    }
+
+    fn update(&mut self, total: u64, completed: u64) -> bool {
+        self.bar.set_length(total);
+        let completed = completed.min(total).max(self.position);
+        if completed == self.position {
+            return false;
+        }
+        self.position = completed;
+        self.bar.set_position(completed);
+        true
+    }
 }
 
 /// POSTs `{"model": reference}` to `path` (e.g. "/api/pull" or "/api/push")
@@ -856,7 +887,7 @@ pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
 
     let mut saw_success = false;
     let mut last_status = String::new();
-    let mut bar: Option<ProgressBar> = None;
+    let mut bar: Option<TransferProgress> = None;
     // Set once we've printed the "already have it" shortcut line (see this
     // function's own doc comment), so a pull whose bytes were all
     // instant-credited doesn't print that line again on every further
@@ -873,7 +904,7 @@ pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
         };
         if let Some(err) = msg.error.filter(|e| !e.is_empty()) {
             if let Some(b) = bar.take() {
-                b.abandon(); // leave whatever was drawn in place instead of clearing it
+                b.bar.abandon(); // leave whatever was drawn in place instead of clearing it
             }
             // Only prefix with `reference` if the error doesn't already
             // mention it — many pull failures (e.g. containerd's "not
@@ -925,21 +956,15 @@ pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
 
             // A byte-level progress line: render/update the bar instead of
             // printing a new line for every update.
-            let pb = bar.get_or_insert_with(|| {
-                let pb = ProgressBar::new(total);
-                pb.set_style(progress_bar_style());
-                pb.set_message(reference.to_string());
-                pb
-            });
-            pb.set_length(total);
-            pb.set_position(completed);
+            let progress = bar.get_or_insert_with(|| TransferProgress::new(total, reference));
+            progress.update(total, completed);
             continue;
         }
         // No byte counts on this line: finish/clear any bar in progress
         // before falling back to plain status text, so the two don't
         // interleave on the same terminal lines.
         if let Some(b) = bar.take() {
-            b.finish_and_clear();
+            b.bar.finish_and_clear();
         }
         if let Some(status) = msg.status {
             if !status.is_empty() && status != last_status {
@@ -950,7 +975,7 @@ pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
         }
     }
     if let Some(b) = bar.take() {
-        b.finish_and_clear();
+        b.bar.finish_and_clear();
     }
     if !saw_success {
         anyhow::bail!("{reference}: stream ended without a success status");
@@ -1193,6 +1218,88 @@ fn encode_path_segment(segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indicatif::TermLike;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug)]
+    struct RecordingTerm(Arc<Mutex<Vec<String>>>);
+
+    impl TermLike for RecordingTerm {
+        fn width(&self) -> u16 {
+            120
+        }
+
+        fn move_cursor_up(&self, _n: usize) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn move_cursor_down(&self, _n: usize) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn move_cursor_right(&self, _n: usize) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn move_cursor_left(&self, _n: usize) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn write_line(&self, s: &str) -> io::Result<()> {
+            self.0.lock().unwrap().push(s.to_string());
+            Ok(())
+        }
+
+        fn write_str(&self, s: &str) -> io::Result<()> {
+            self.0.lock().unwrap().push(s.to_string());
+            Ok(())
+        }
+
+        fn clear_line(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn flush(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Synthetic paced snapshots must advance to their exact byte positions
+    /// and only real movement (not steady redraws) may count as an update or
+    /// produce a transfer rate.
+    #[test]
+    fn transfer_progress_tracks_real_movement_and_nonzero_speed() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let target = ProgressDrawTarget::term_like(Box::new(RecordingTerm(writes.clone())));
+        let mut progress = TransferProgress::with_target(100, "example/model", target);
+
+        assert!(!progress.update(100, 0));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(progress.update(100, 25));
+        assert_eq!(progress.bar.position(), 25);
+        assert!(!progress.update(100, 25), "redraw is not byte movement");
+        assert!(!progress.update(100, 20), "out-of-order snapshot regresses");
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(progress.update(100, 100));
+        assert_eq!(progress.bar.position(), 100);
+        assert!(progress.bar.per_sec().is_finite());
+        assert!(progress.bar.per_sec() > 0.0);
+        progress.bar.tick();
+        let rendered = writes.lock().unwrap().join(" ");
+        let fields: Vec<&str> = rendered.split_whitespace().collect();
+        assert!(
+            fields.windows(2).any(|pair| {
+                pair[1].ends_with("B/s")
+                    && pair[0]
+                        .trim_matches(|c: char| !c.is_ascii_digit() && c != '.')
+                        .parse::<f64>()
+                        .is_ok_and(|rate| rate.is_finite() && rate > 0.0)
+            }),
+            "expected a visibly nonzero finite bytes/s field after movement: {rendered:?}"
+        );
+        progress.bar.finish_and_clear();
+    }
 
     /// The two locality questions differ on exactly one host, and it is
     /// the one that matters: a wildcard bind is reached over loopback
