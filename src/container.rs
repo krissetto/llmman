@@ -469,6 +469,30 @@ mod tests {
     }
 
     #[test]
+    fn speculative_decoding_environment_is_forwarded_to_containers() {
+        for var in [
+            "LLAMA_ARG_SPEC_TYPE",
+            "LLAMA_ARG_SPEC_DRAFT_MODEL",
+            "LLAMA_ARG_SPEC_DRAFT_HF_REPO",
+            "LLAMA_ARG_SPEC_DRAFT_N_MAX",
+            "LLAMA_ARG_SPEC_DRAFT_N_MIN",
+            "LLAMA_ARG_SPEC_DRAFT_P_MIN",
+            "LLAMA_ARG_SPEC_DRAFT_P_SPLIT",
+            "LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K",
+            "LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V",
+            "LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING",
+            "LLAMA_ARG_SPEC_DRAFT_CPU_MOE",
+            "LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE",
+            "LLAMA_ARG_N_GPU_LAYERS_DRAFT",
+        ] {
+            assert!(
+                crate::cmd::serve::LLAMA_CPP_ENV_PASSTHROUGH_VARS.contains(&var),
+                "missing speculative decoding environment variable {var}"
+            );
+        }
+    }
+
+    #[test]
     fn image_tags_match_docs_docker_md() {
         assert_eq!(GpuBackend::Cpu.image_tag(), "server");
         assert_eq!(GpuBackend::Cuda12.image_tag(), "server-cuda");

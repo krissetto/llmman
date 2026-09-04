@@ -60,6 +60,19 @@ Environment Variables:
       LLAMA_ARG_FIT                  Enable llama.cpp automatic fit of unset memory options (default \"on\")
       LLAMA_ARG_FIT_TARGET           Target free VRAM margin per device for llama.cpp fit (MiB)
       LLAMA_ARG_THREADS              Thread count for llama-server (default: llama-server autodetection, overridden by a binding CPU quota/affinity limit)
+      LLAMA_ARG_SPEC_TYPE                    Comma-separated speculative decoding types (default: none; includes draft-mtp)
+      LLAMA_ARG_SPEC_DRAFT_MODEL             Draft model file for speculative decoding (default: unused)
+      LLAMA_ARG_SPEC_DRAFT_HF_REPO           Hugging Face repository and optional quantization for the draft model
+      LLAMA_ARG_SPEC_DRAFT_N_MAX              Number of tokens to draft per speculative decoding step
+      LLAMA_ARG_SPEC_DRAFT_N_MIN              Minimum number of draft tokens to use per speculative decoding step
+      LLAMA_ARG_SPEC_DRAFT_P_MIN              Minimum speculative decoding probability for greedy decoding
+      LLAMA_ARG_SPEC_DRAFT_P_SPLIT            Speculative decoding split probability
+      LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K       KV-cache data type for K for the draft model (default: f16)
+      LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V       KV-cache data type for V for the draft model (default: f16)
+      LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING   Enable or disable offloading draft sampling to the backend
+      LLAMA_ARG_SPEC_DRAFT_CPU_MOE            Keep all draft-model Mixture-of-Experts weights on the CPU
+      LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE          Keep the first N draft-model Mixture-of-Experts layers on the CPU
+      LLAMA_ARG_N_GPU_LAYERS_DRAFT            Draft-model layers to store in VRAM (an exact number, auto, or all)
 ";
 
 #[derive(Args, Debug)]
@@ -5650,8 +5663,24 @@ pub const GPU_VISIBLE_DEVICE_VARS: &[&str] = &[
 /// llama.cpp's own env-configurable arguments (`common/arg.cpp`'s
 /// `set_env`), forwarded the same way as [`GPU_VISIBLE_DEVICE_VARS`] —
 /// llama-server reads these itself, llmman just makes sure they reach it.
-pub const LLAMA_CPP_ENV_PASSTHROUGH_VARS: &[&str] =
-    &["LLAMA_ARG_FIT", "LLAMA_ARG_FIT_TARGET", "LLAMA_ARG_THREADS"];
+pub const LLAMA_CPP_ENV_PASSTHROUGH_VARS: &[&str] = &[
+    "LLAMA_ARG_FIT",
+    "LLAMA_ARG_FIT_TARGET",
+    "LLAMA_ARG_THREADS",
+    "LLAMA_ARG_SPEC_TYPE",
+    "LLAMA_ARG_SPEC_DRAFT_MODEL",
+    "LLAMA_ARG_SPEC_DRAFT_HF_REPO",
+    "LLAMA_ARG_SPEC_DRAFT_N_MAX",
+    "LLAMA_ARG_SPEC_DRAFT_N_MIN",
+    "LLAMA_ARG_SPEC_DRAFT_P_MIN",
+    "LLAMA_ARG_SPEC_DRAFT_P_SPLIT",
+    "LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K",
+    "LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V",
+    "LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING",
+    "LLAMA_ARG_SPEC_DRAFT_CPU_MOE",
+    "LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE",
+    "LLAMA_ARG_N_GPU_LAYERS_DRAFT",
+];
 
 /// Resolves the `llama-server` binary to run locally (no `--ociman`):
 /// prefers whatever is already on `PATH` untouched, unless
@@ -8168,6 +8197,42 @@ mod tests {
     /// field) must be folded into one message at index 0, never left in
     /// place, or llama.cpp's chat templates raise "System message must be
     /// at the beginning" on the second one.
+    #[test]
+    fn serve_help_documents_forwarded_speculative_decoding_environment() {
+        for var in LLAMA_CPP_ENV_PASSTHROUGH_VARS
+            .iter()
+            .filter(|var| var.contains("SPEC") || var.contains("DRAFT"))
+        {
+            assert!(
+                SERVE_ENV_HELP.contains(var),
+                "serve environment help is missing forwarded variable {var}"
+            );
+        }
+    }
+
+    #[test]
+    fn serve_help_describes_speculative_environment_accurately() {
+        for description in [
+            "Comma-separated speculative decoding types",
+            "Draft model file for speculative decoding",
+            "Hugging Face repository and optional quantization for the draft model",
+            "Minimum number of draft tokens",
+            "Minimum speculative decoding probability for greedy decoding",
+            "Speculative decoding split probability",
+            "KV-cache data type for K for the draft model",
+            "KV-cache data type for V for the draft model",
+            "offloading draft sampling to the backend",
+            "Keep all draft-model Mixture-of-Experts weights on the CPU",
+            "Keep the first N draft-model Mixture-of-Experts layers on the CPU",
+            "Draft-model layers to store in VRAM",
+        ] {
+            assert!(
+                SERVE_ENV_HELP.contains(description),
+                "serve environment help is missing description {description:?}"
+            );
+        }
+    }
+
     #[test]
     fn build_anthropic_messages_merges_system_role_messages_anywhere_in_the_conversation() {
         let req: AnthropicRequest = serde_json::from_value(serde_json::json!({
